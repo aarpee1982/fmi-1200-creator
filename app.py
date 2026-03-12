@@ -405,62 +405,72 @@ with tab_run:
 # MANAGE BRIEFS TAB
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_briefs:
-    st.subheader("Market Briefs")
+    from fmi_batch_factory.briefs import market_name_to_brief
+
     briefs = _load_briefs()
     seen   = _load_seen()
 
-    _, col_reset = st.columns([4, 1])
-    with col_reset:
-        if st.button("Reset seen list"):
-            SEEN_PATH.write_text("[]", encoding="utf-8")
-            st.success("Cleared.")
-            st.rerun()
+    # ── Paste market names ────────────────────────────────────────────────
+    st.subheader("Add Markets")
+    st.caption("Paste up to 10 market names, one per line. Click Add.")
 
-    if briefs:
+    pasted = st.text_area(
+        "Market names",
+        placeholder="Closed System Bioprocessing Market\nAmitriptyline Hydrochloride Market\nContinuous Bioprocessing Market",
+        height=220,
+        label_visibility="collapsed",
+    )
+
+    if st.button("➕ Add to Queue", type="primary"):
+        lines = [l.strip() for l in pasted.splitlines() if l.strip()][:10]
+        existing_names = {b["market_name"].lower() for b in briefs}
+        added = []
+        for name in lines:
+            if name.lower() not in existing_names:
+                briefs.append(market_name_to_brief(name))
+                existing_names.add(name.lower())
+                added.append(name)
+        if added:
+            _save_briefs(briefs)
+            st.success(f"Added {len(added)} market(s): {', '.join(added)}")
+            st.rerun()
+        else:
+            st.info("All names already in queue.")
+
+    # ── Current queue ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"Current Queue ({len(briefs)} markets)")
+
+    if not briefs:
+        st.info("Queue is empty. Paste market names above.")
+    else:
+        col_clear, col_reset = st.columns([1, 1])
+        with col_clear:
+            if st.button("🗑 Clear all markets"):
+                _save_briefs([])
+                SEEN_PATH.write_text("[]", encoding="utf-8")
+                st.success("Queue cleared.")
+                st.rerun()
+        with col_reset:
+            if st.button("🔄 Reset completed (reprocess all)"):
+                SEEN_PATH.write_text("[]", encoding="utf-8")
+                st.success("All marked as pending again.")
+                st.rerun()
+
+        st.markdown("")
         for i, b in enumerate(briefs):
             slug = b.get("market_slug", slugify(b.get("market_name", "")))
-            with st.expander(f"{'✅' if slug in seen else '⏳'} {b.get('market_name', 'Unnamed')}"):
-                st.json(b)
-                if st.button("Remove", key=f"rm_{i}"):
-                    briefs.pop(i); _save_briefs(briefs); st.rerun()
-    else:
-        st.info("No briefs yet. Add one below or upload a JSON file.")
-
-    st.markdown("---")
-    st.subheader("Add a Brief")
-    with st.form("add_form"):
-        mn  = st.text_input("Market Name *", placeholder="e.g. Closed System Bioprocessing Market")
-        dom = st.text_input("Domain", value="healthcare-pharma")
-        geo = st.text_input("Geography", value="global")
-        par = st.text_input("Parent Market")
-        seg = st.text_area("Segments (JSON dict)",
-            value='{"product_type":["Type A","Type B"],"application":["App 1","App 2"],"distribution_channel":["Direct","Indirect"]}',
-            height=80)
-        ctr = st.text_input("Priority Countries",
-            value="United States, Germany, United Kingdom, India, China, Brazil")
-        bch = st.text_input("Benchmark Variables",
-            value="healthcare expenditure, R&D investment, regulatory approvals")
-        if st.form_submit_button("Add Brief") and mn:
-            try: segs = json.loads(seg)
-            except: segs = {}
-            _save_briefs(briefs + [{
-                "market_name": mn, "market_slug": slugify(mn), "domain": dom,
-                "geography": geo, "parent_market": par, "segments": segs,
-                "priority_countries":  [x.strip() for x in ctr.split(",") if x.strip()],
-                "benchmark_variables": [x.strip() for x in bch.split(",") if x.strip()],
-                "notes": ["Use authoritative public sources.", "Proxy estimation allowed."],
-            }])
-            st.success(f"Added: {mn}"); st.rerun()
-
-    st.markdown("---")
-    st.subheader("Upload Briefs JSON")
-    up = st.file_uploader("Upload market_briefs.json", type="json")
-    if up:
-        try:
-            data = json.load(up); _save_briefs(data)
-            st.success(f"Loaded {len(data)} briefs."); st.rerun()
-        except Exception as e:
-            st.error(f"Parse error: {e}")
+            status = "✅ Done" if slug in seen else "⏳ Pending"
+            col_name, col_status, col_remove = st.columns([6, 2, 1])
+            with col_name:
+                st.write(b.get("market_name", ""))
+            with col_status:
+                st.write(status)
+            with col_remove:
+                if st.button("✕", key=f"rm_{i}"):
+                    briefs.pop(i)
+                    _save_briefs(briefs)
+                    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

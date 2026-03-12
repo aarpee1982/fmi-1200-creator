@@ -1,26 +1,28 @@
 from __future__ import annotations
-
-import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from .utils import slugify
 
 
-@dataclass
-class MarketBrief:
-    market_name: str
-    market_slug: str
-    raw: dict[str, Any]
+DEFAULT_SEGMENTS = {
+    "product_type": ["Type A", "Type B", "Type C"],
+    "application":  ["Application 1", "Application 2", "Application 3"],
+    "end_user":     ["Segment 1", "Segment 2", "Segment 3"],
+}
+
+DEFAULT_COUNTRIES = ["United States", "Germany", "United Kingdom", "India", "China", "Brazil"]
+DEFAULT_VARIABLES = ["market size", "regulatory approvals", "industry growth rate"]
 
 
-def load_pending_briefs(path: Path, seen: set[str], limit: int) -> list[MarketBrief]:
-    rows = json.loads(path.read_text(encoding='utf-8'))
-    out: list[MarketBrief] = []
-    for row in rows:
-        slug = row.get('market_slug') or row.get('market_name')
-        if slug in seen:
-            continue
-        out.append(MarketBrief(market_name=row['market_name'], market_slug=slug, raw=row))
-        if len(out) >= limit:
-            break
-    return out
+def market_name_to_brief(market_name: str) -> dict:
+    """Convert a plain market name string into a minimal brief dict."""
+    name = market_name.strip()
+    return {
+        "market_name":         name,
+        "market_slug":         slugify(name),
+        "domain":              "global",
+        "geography":           "global",
+        "parent_market":       "",
+        "segments":            DEFAULT_SEGMENTS,
+        "priority_countries":  DEFAULT_COUNTRIES,
+        "benchmark_variables": DEFAULT_VARIABLES,
+        "notes":               ["Use authoritative public sources.", "Proxy estimation allowed."],
+    }

@@ -16,10 +16,10 @@ from .renderer import render_docx
 from .utils import filename_for_market, slugify
 
 
-BATCH_SIZE = 10          # max articles loaded per run
-CONCURRENCY = 3          # articles processed at a time
+BATCH_SIZE     = 10
+CONCURRENCY    = 3
 FORECAST_START = 2026
-FORECAST_END = 2036
+FORECAST_END   = 2036
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -27,12 +27,62 @@ def _write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _query_for_brief(brief: dict) -> str:
-    return (
-        f"{brief['market_name']} global market size forecast public sources; "
-        f"priority countries: {', '.join(brief.get('priority_countries', []))}; "
-        f"benchmark variables: {', '.join(brief.get('benchmark_variables', []))}"
-    )
+def _search_queries(brief: dict) -> list[tuple[str, bool]]:
+    """
+    Returns list of (query_string, allow_company_sources) tuples.
+    We fire 5 targeted searches instead of 1 vague one.
+    allow_company_sources=True relaxes the domain filter for that query
+    so company annual reports and investor pages can pass through.
+    """
+    name = brief["market_name"]
+    countries = ", ".join(brief.get("priority_countries", [])[:4])
+    segments  = ", ".join(brief.get("benchmark_variables", [])[:3])
+
+    return [
+        # 1. Market sizing — regulatory and government sources
+        (f"{name} market size value 2024 2025 industry statistics government FDA WHO", False),
+
+        # 2. Key companies — explicitly target company filings and profiles
+        (f"{name} leading companies manufacturers market share annual report revenue 2024 2025", True),
+
+        # 3. Country/regional data
+        (f"{name} market by country {countries} growth rate statistics", False),
+
+        # 4. Regulatory and clinical drivers
+        (f"{name} regulatory approval clinical guidelines treatment trends {segments}", False),
+
+        # 5. Recent developments — M&A, launches, partnerships
+        (f"{name} market news acquisitions product launches partnerships 2024 2025", True),
+    ]
+
+
+def _multi_search(client: OpenAIWebSearchClient, brief: dict, log: Callable) -> dict:
+    """Fire multiple targeted searches and merge the evidence cards."""
+    name = brief["market_name"]
+    queries = _search_queries(brief)
+    all_cards: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for query, allow_companies in queries:
+        try:
+            log(f"[{name}] Searching: {query[:70]}...")
+            result = client.search_once(query, allow_company_sources=allow_companies)
+            for card in result.get("evidence_cards", []):
+                url = card.get("url", "")
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_cards.append(card)
+            time.sleep(0.5)  # avoid rate limits
+        except Exception as e:
+            log(f"[{name}] Search failed for query: {e}")
+            continue
+
+    log(f"[{name}] Total unique evidence cards: {len(all_cards)}")
+    return {
+        "evidence_cards": all_cards,
+        "raw_evidence_card_count": len(all_cards),
+        "filtered_evidence_card_count": len(all_cards),
+    }
 
 
 def _load_seen(seen_path: Path) -> set[str]:
@@ -47,8 +97,7 @@ def _save_seen(seen_path: Path, seen: set[str]) -> None:
 
 
 def _has_valid_numbers(fp: dict, forecast_end: int) -> bool:
-    keys = ["value_2026_usd_bn", f"value_{forecast_end}_usd_bn", "cagr_pct"]
-    for k in keys:
+    for k in ["value_2026_usd_bn", f"value_{forecast_end}_usd_bn", "cagr_pct"]:
         try:
             if fp.get(k) is None or float(fp[k]) <= 0:
                 return False
@@ -68,22 +117,22 @@ def _process_one(
 ) -> dict:
     market_name = brief.get("market_name", "Unknown")
     market_slug = brief.get("market_slug", slugify(market_name))
-    market_dir = output_dir / market_slug
+    market_dir  = output_dir / market_slug
 
     try:
-        log(f"[{market_name}] Searching for evidence...")
-        evidence_pack = search_client.search_once(_query_for_brief(brief))
+        # 5 targeted searches instead of 1
+        evidence_pack = _multi_search(search_client, brief, log)
 
-        log(f"[{market_name}] Assessing foundation ({evidence_pack.get('filtered_evidence_card_count', 0)} cards)...")
+        log(f"[{market_name}] Assessing foundation ({len(evidence_pack.get('evidence_cards', []))} cards)...")
         foundation = assess_foundation(evidence_pack)
 
-        log(f"[{market_name}] Building fact pack with DeepSeek...")
+        log(f"[{market_name}] Building fact pack (DeepSeek reasoning)...")
         fact_pack = build_fact_pack(ds_client, brief, evidence_pack, foundation, FORECAST_START, FORECAST_END)
 
         if not _has_valid_numbers(fact_pack, FORECAST_END):
             raise ValueError("Fact pack has zero or missing core numbers.")
 
-        log(f"[{market_name}] Running 3 prose agents in parallel...")
+        log(f"[{market_name}] Running prose agents in parallel...")
         article = build_article(
             ds_client, kimi_client, openai_prose_client,
             fact_pack, evidence_pack, FORECAST_START, FORECAST_END,
@@ -101,22 +150,18 @@ def _process_one(
         log(f"[{market_name}] Done. DOCX saved.")
 
         return {
-            "market_name": market_name,
-            "market_slug": market_slug,
-            "status": "processed",
-            "winning_agent": winning,
+            "market_name":      market_name,
+            "market_slug":      market_slug,
+            "status":           "processed",
+            "winning_agent":    winning,
             "foundation_status": foundation["status"],
-            "evidence_cards": foundation["evidence_cards"],
-            "docx_path": str(docx_path),
+            "evidence_cards":   foundation["evidence_cards"],
+            "docx_path":        str(docx_path),
         }
 
     except Exception as exc:
-        fail = {
-            "market_name": market_name,
-            "market_slug": market_slug,
-            "status": "failed",
-            "error": str(exc),
-        }
+        fail = {"market_name": market_name, "market_slug": market_slug,
+                "status": "failed", "error": str(exc)}
         market_dir.mkdir(parents=True, exist_ok=True)
         _write_json(market_dir / "run_result.json", fail)
         log(f"[{market_name}] FAILED: {exc}")
@@ -138,11 +183,10 @@ def run_batch(
     batch_size: int = BATCH_SIZE,
     concurrency: int = CONCURRENCY,
 ) -> dict:
-    # Load briefs
     all_briefs = json.loads(briefs_path.read_text(encoding="utf-8"))
-    seen = _load_seen(seen_path)
-    pending = [b for b in all_briefs if b.get("market_slug", slugify(b.get("market_name", ""))) not in seen]
-    batch = pending[:batch_size]
+    seen       = _load_seen(seen_path)
+    pending    = [b for b in all_briefs if b.get("market_slug", slugify(b.get("market_name", ""))) not in seen]
+    batch      = pending[:batch_size]
 
     if not batch:
         log("No pending briefs to process.")
@@ -150,22 +194,17 @@ def run_batch(
 
     log(f"Loaded {len(batch)} briefs. Running {concurrency} at a time.")
 
-    # Instantiate clients
-    search_client = OpenAIWebSearchClient(api_key=openai_key)
-    ds_client = DeepSeekClient(api_key=deepseek_key, base_url=deepseek_base_url, model=deepseek_model)
-    kimi_client = KimiClient(api_key=kimi_key, base_url=kimi_base_url, model=kimi_model)
+    search_client       = OpenAIWebSearchClient(api_key=openai_key)
+    ds_client           = DeepSeekClient(api_key=deepseek_key, base_url=deepseek_base_url, model=deepseek_model)
+    kimi_client         = KimiClient(api_key=kimi_key, base_url=kimi_base_url, model=kimi_model)
     openai_prose_client = OpenAIProseClient(api_key=openai_key)
 
     summary = {"processed": 0, "failed": 0, "items": []}
 
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures = {
-            ex.submit(
-                _process_one,
-                brief, output_dir,
-                search_client, ds_client, kimi_client, openai_prose_client,
-                log,
-            ): brief
+            ex.submit(_process_one, brief, output_dir,
+                      search_client, ds_client, kimi_client, openai_prose_client, log): brief
             for brief in batch
         }
         for fut in as_completed(futures):

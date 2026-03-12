@@ -11,49 +11,53 @@ BLOCKED_DOMAINS = {
     "introspectivemarketresearch.com", "flairinsights.com", "wiseguyreports.com",
     "fortunebusinessinsights.com", "marketsandmarkets.com", "precedenceresearch.com",
     "verifiedmarketresearch.com", "coherentmarketinsights.com", "researchandmarkets.com",
-    "openpr.com", "globenewswire.com", "prnewswire.com", "businesswire.com", "statista.com"
+    "openpr.com", "globenewswire.com", "prnewswire.com", "businesswire.com", "statista.com",
 }
 
 PREFERRED_DOMAIN_KEYWORDS = [
     ".gov", ".edu", "who.int", "fda.gov", "ema.europa.eu", "nih.gov",
     "ncbi.nlm.nih.gov", "cdc.gov", "oecd.org", "worldbank.org", "imf.org",
     "europa.eu", "un.org", "fred.stlouisfed.org", "census.gov", "bea.gov",
-    "bls.gov", "trade.gov", "usitc.gov", "comtrade", "wits.worldbank.org"
+    "bls.gov", "trade.gov", "usitc.gov", "comtrade", "wits.worldbank.org",
 ]
 
-ALLOWED_AUTHORITY_TYPES = {
-    "government", "regulator", "multilateral", "public_statistical_body",
-    "public_health_agency", "public_trade_database", "public_prescription_dataset",
-    "first_party_public_filing"
-}
-
-# The top OpenAI model for article generation
 OPENAI_TOP_MODEL = "gpt-4o"
 
 
 class OpenAIWebSearchClient:
-    """Uses OpenAI Responses API with web_search tool to gather evidence."""
-
     def __init__(self, api_key: str, search_model: str = "gpt-4o-mini"):
-        self.api_key = api_key
+        self.api_key      = api_key
         self.search_model = search_model
 
-    def search_once(self, query: str) -> dict[str, Any]:
+    def search_once(self, query: str, allow_company_sources: bool = False) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+        if allow_company_sources:
+            source_guidance = (
+                "Search broadly — include company annual reports, investor relations pages, "
+                "company press releases, Wikipedia, industry association pages, and public filings "
+                "in addition to government sources. The goal is to find ACTUAL COMPANY NAMES, "
+                "recent M&A activity, and product launches. Do NOT use commercial market research firms."
+            )
+        else:
+            source_guidance = (
+                "Strongly prefer government sites, regulators, multilateral agencies, public statistical bodies, "
+                "public health agencies, public trade or customs databases, public prescription datasets, "
+                "and first-party public company filings. Do NOT use commercial market-research firms, "
+                "press-release syndication sites, or SEO listicles."
+            )
+
         user_prompt = (
-            "Search the web using ONLY authoritative non-commercial sources wherever possible. "
-            "Strongly prefer government sites, regulators, multilateral agencies, public statistical bodies, "
-            "public health agencies, public trade or customs databases, public prescription or utilization datasets, "
-            "and first-party public company filings. "
-            "Do NOT use commercial market-research firms, press-release syndication sites, SEO listicles, or news rewrites. "
+            f"{source_guidance} "
             "Return ONLY structured JSON with an array called evidence_cards. "
-            "Each evidence card must contain: source, publisher, url, date, claim, metric, unit, geography, time_period, "
+            "Each card must have: source, publisher, url, date, claim, metric, unit, geography, time_period, "
             "authority_type, numeric_signal, confidence, why_relevant, non_commercial_likely. "
-            f"Query focus: {query}"
+            f"Query: {query}"
         )
+
         payload = {
             "model": self.search_model,
             "input": user_prompt,
@@ -72,35 +76,36 @@ class OpenAIWebSearchClient:
                                     "type": "object",
                                     "additionalProperties": False,
                                     "properties": {
-                                        "source": {"type": "string"},
-                                        "publisher": {"type": "string"},
-                                        "url": {"type": "string"},
-                                        "date": {"type": "string"},
-                                        "claim": {"type": "string"},
-                                        "metric": {"type": "string"},
-                                        "unit": {"type": "string"},
-                                        "geography": {"type": "string"},
-                                        "time_period": {"type": "string"},
-                                        "authority_type": {"type": "string"},
-                                        "numeric_signal": {"type": "string"},
-                                        "confidence": {"type": "string"},
-                                        "why_relevant": {"type": "string"},
-                                        "non_commercial_likely": {"type": "boolean"}
+                                        "source":               {"type": "string"},
+                                        "publisher":            {"type": "string"},
+                                        "url":                  {"type": "string"},
+                                        "date":                 {"type": "string"},
+                                        "claim":                {"type": "string"},
+                                        "metric":               {"type": "string"},
+                                        "unit":                 {"type": "string"},
+                                        "geography":            {"type": "string"},
+                                        "time_period":          {"type": "string"},
+                                        "authority_type":       {"type": "string"},
+                                        "numeric_signal":       {"type": "string"},
+                                        "confidence":           {"type": "string"},
+                                        "why_relevant":         {"type": "string"},
+                                        "non_commercial_likely": {"type": "boolean"},
                                     },
                                     "required": [
                                         "source", "publisher", "url", "date", "claim",
                                         "metric", "unit", "geography", "time_period",
                                         "authority_type", "numeric_signal", "confidence",
-                                        "why_relevant", "non_commercial_likely"
-                                    ]
-                                }
+                                        "why_relevant", "non_commercial_likely",
+                                    ],
+                                },
                             }
                         },
-                        "required": ["evidence_cards"]
-                    }
+                        "required": ["evidence_cards"],
+                    },
                 }
-            }
+            },
         }
+
         resp = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=300)
         resp.raise_for_status()
         data = resp.json()
@@ -125,31 +130,41 @@ class OpenAIWebSearchClient:
                 output_text = output_text[4:].strip()
 
         parsed = json.loads(output_text)
-        cards = parsed.get("evidence_cards", [])
-        filtered = self._filter(cards)
+        cards  = parsed.get("evidence_cards", [])
+        filtered = self._filter(cards, allow_company_sources)
+
         return {
-            "evidence_cards": filtered,
-            "raw_evidence_card_count": len(cards),
+            "evidence_cards":            filtered,
+            "raw_evidence_card_count":   len(cards),
             "filtered_evidence_card_count": len(filtered),
         }
 
-    def _filter(self, cards: list[dict]) -> list[dict]:
+    def _filter(self, cards: list[dict], allow_company_sources: bool) -> list[dict]:
         kept = []
         for card in cards:
-            url = (card.get("url") or "").strip()
+            url    = (card.get("url") or "").strip()
             domain = self._domain(url)
             card["domain"] = domain
+
             if self._is_blocked(domain):
                 continue
-            authority = (card.get("authority_type") or "").strip().lower()
-            preferred = any(k in domain for k in PREFERRED_DOMAIN_KEYWORDS) if domain else False
-            if authority in ALLOWED_AUTHORITY_TYPES or preferred or bool(card.get("non_commercial_likely", False)):
+
+            if allow_company_sources:
+                # Relaxed filter — keep anything not on the blocked list
                 kept.append(card)
+            else:
+                # Strict filter — prefer government and authoritative sources
+                authority = (card.get("authority_type") or "").strip().lower()
+                preferred = any(k in domain for k in PREFERRED_DOMAIN_KEYWORDS) if domain else False
+                if authority or preferred or bool(card.get("non_commercial_likely", False)):
+                    kept.append(card)
+
+        # Sort: non-commercial first, numeric signal second
         kept.sort(key=lambda c: (
             0 if bool(c.get("non_commercial_likely", False)) else 1,
             0 if str(c.get("numeric_signal", "")).strip() else 1,
         ))
-        return kept[:25]
+        return kept[:30]
 
     def _domain(self, url: str) -> str:
         try:
@@ -165,11 +180,9 @@ class OpenAIWebSearchClient:
 
 
 class OpenAIProseClient:
-    """Uses OpenAI's top model (GPT-4o) for article prose generation."""
-
     def __init__(self, api_key: str, model: str = OPENAI_TOP_MODEL):
         self.api_key = api_key
-        self.model = model
+        self.model   = model
 
     def complete_json(self, system: str, user: str, temperature: float = 0.4, max_tokens: int = 6000) -> dict[str, Any]:
         text = self.complete_text(system, user, temperature=temperature, max_tokens=max_tokens)
@@ -189,10 +202,10 @@ class OpenAIProseClient:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user",   "content": user},
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "temperature":     temperature,
+            "max_tokens":      max_tokens,
             "response_format": {"type": "json_object"},
         }
         resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=300)
