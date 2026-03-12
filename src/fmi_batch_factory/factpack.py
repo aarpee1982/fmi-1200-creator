@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 
-from .deepseek_client import DeepSeekClient
+from .openai_client import OpenAIReasoningClient
 
 FACTPACK_SYSTEM = """
-You are a senior FMI market analyst building a structured fact pack.
-Return only valid JSON. No markdown, no explanation.
-Proxy-based estimation is allowed when direct market-size data is absent — say so in method_notes.
-Do not invent citations. Do NOT write "generic manufacturers" or "various companies" for key_players.
+You are a senior FMI market analyst. Return only valid JSON. No markdown, no explanation.
+You have deep knowledge of global industry markets. Use that knowledge to fill gaps when evidence is thin.
+Never write "generic manufacturers", "various companies", "Type A", "Type B", "Segment 1", or placeholder text.
+Every field must contain real, specific, accurate information for this exact market.
 """
 
 
@@ -19,42 +19,45 @@ def build_factpack_prompt(
     forecast_start: int,
     forecast_end: int,
 ) -> str:
-    # Extract company mentions from evidence cards to help DeepSeek
     cards = evidence_pack.get("evidence_cards", [])
     company_mentions = []
     for card in cards:
-        claim = card.get("claim", "")
+        claim     = card.get("claim", "")
         publisher = card.get("publisher", "")
-        # Include publisher if it looks like a company (not a government body)
         if publisher and not any(x in publisher.lower() for x in ["government", "who", "fda", "ema", "cdc", "nih", "ministry"]):
             company_mentions.append(publisher)
-        # Pull company names from claims
-        if any(word in claim.lower() for word in ["acquired", "launched", "partnership", "revenue", "market share", "announced"]):
+        if any(w in claim.lower() for w in ["acquired", "launched", "partnership", "revenue", "market share", "announced"]):
             company_mentions.append(claim[:200])
 
-    company_context = "\n".join(set(company_mentions[:20])) if company_mentions else "None found in evidence — use your training knowledge of this market."
-
+    company_context = "\n".join(set(company_mentions[:20])) if company_mentions else "Use your knowledge of this market."
     years = forecast_end - forecast_start
+    market = brief.get("market_name", "")
 
     return f"""
-Build a complete market fact pack for: {brief.get("market_name")}
+Build a complete market fact pack for: {market}
 Forecast period: {forecast_start} to {forecast_end} ({years} years)
 
-COMPANY NAMES FOUND IN EVIDENCE (use these for key_players):
+STEP 1 — DETERMINE REAL SEGMENTS:
+Based on your knowledge of the {market}, identify the 3 most important segmentation dimensions used in industry analysis.
+For each dimension, list the real segment names used in this market (not placeholders like "Type A").
+Example for a pharma market: dimensions would be "dosage_form", "indication", "distribution_channel"
+Example for a bioprocessing market: dimensions would be "product_type", "workflow", "end_user"
+
+COMPANY NAMES FROM EVIDENCE:
 {company_context}
 
-IMPORTANT RULE FOR key_players:
-- List ACTUAL named companies (e.g. "Teva Pharmaceuticals", "Sartorius AG", "Thermo Fisher Scientific")
-- Use your training knowledge of who the real players are in this market
-- Never write "generic manufacturers", "various companies", or "major players"
-- Minimum 6 specific company names, up to 12
+RULES:
+- key_players: REAL named companies only. Minimum 6. Use your training knowledge.
+- segment names: REAL industry-standard names for this specific market. No placeholders.
+- segment shares must sum to ~100% within each dimension.
+- bibliography_items: real citable sources only. Format: "Organization. Year. Title."
 
-Return this exact JSON shape:
+Return this exact JSON:
 {{
-  "market_name": "...",
-  "market_slug": "...",
-  "status": "strong_foundation|moderate_foundation|weak_foundation",
-  "confidence_score": 0,
+  "market_name": "{market}",
+  "market_slug": "{brief.get('market_slug', '')}",
+  "status": "moderate_foundation",
+  "confidence_score": 70,
   "value_2025_usd_bn": 0.0,
   "value_2026_usd_bn": 0.0,
   "value_{forecast_end}_usd_bn": 0.0,
@@ -68,22 +71,33 @@ Return this exact JSON shape:
     {{"country": "Brazil", "cagr_pct": 0.0, "basis": "..."}}
   ],
   "segment_shares": {{
-    "segment_dim_1": [{{"segment": "...", "share_pct": 0.0, "basis": "..."}}],
-    "segment_dim_2": [{{"segment": "...", "share_pct": 0.0, "basis": "..."}}],
-    "segment_dim_3": [{{"segment": "...", "share_pct": 0.0, "basis": "..."}}]
+    "real_dimension_1_name": [
+      {{"segment": "Real Segment Name A", "share_pct": 0.0, "basis": "..."}},
+      {{"segment": "Real Segment Name B", "share_pct": 0.0, "basis": "..."}},
+      {{"segment": "Real Segment Name C", "share_pct": 0.0, "basis": "..."}}
+    ],
+    "real_dimension_2_name": [
+      {{"segment": "Real Segment Name A", "share_pct": 0.0, "basis": "..."}},
+      {{"segment": "Real Segment Name B", "share_pct": 0.0, "basis": "..."}}
+    ],
+    "real_dimension_3_name": [
+      {{"segment": "Real Segment Name A", "share_pct": 0.0, "basis": "..."}},
+      {{"segment": "Real Segment Name B", "share_pct": 0.0, "basis": "..."}},
+      {{"segment": "Real Segment Name C", "share_pct": 0.0, "basis": "..."}}
+    ]
   }},
-  "definition": "...",
+  "definition": "One clear paragraph defining what this market covers.",
   "key_players": [
-    "Company Name 1",
-    "Company Name 2",
-    "Company Name 3",
-    "Company Name 4",
-    "Company Name 5",
-    "Company Name 6"
+    "Real Company Name 1",
+    "Real Company Name 2",
+    "Real Company Name 3",
+    "Real Company Name 4",
+    "Real Company Name 5",
+    "Real Company Name 6"
   ],
   "bibliography_items": [
-    "Organization. Year. Title of document.",
-    "Organization. Year. Title of document."
+    "Organization. Year. Title.",
+    "Organization. Year. Title."
   ],
   "assumptions": ["..."],
   "method_notes": ["..."],
@@ -91,27 +105,15 @@ Return this exact JSON shape:
   "evidence_summary": ["..."]
 }}
 
-Validation rules:
-- value_{forecast_end}_usd_bn must equal value_2026_usd_bn * (1 + cagr_pct/100)^{years} — check the math.
-- value_2025_usd_bn should be slightly less than value_2026_usd_bn.
-- All segment_shares within each dimension must sum to approximately 100%.
-- country_cagrs must include all priority countries from the brief.
-- key_players must be REAL named companies, minimum 6.
-- bibliography_items: only real citable sources (regulatory bodies, company filings, government agencies). Format: "Organization. Year. Title."
+Math check: value_{forecast_end}_usd_bn = value_2026_usd_bn * (1 + cagr_pct/100)^{years}
 
-Market brief:
-{json.dumps(brief, ensure_ascii=False)}
-
-Foundation check:
-{json.dumps(foundation_check, ensure_ascii=False)}
-
-Evidence pack (first 4000 chars):
-{json.dumps(evidence_pack, ensure_ascii=False)[:4000]}
+Evidence pack summary (first 3000 chars):
+{json.dumps(evidence_pack, ensure_ascii=False)[:3000]}
 """
 
 
 def build_fact_pack(
-    client: DeepSeekClient,
+    client: OpenAIReasoningClient,
     brief: dict,
     evidence_pack: dict,
     foundation_check: dict,
@@ -119,4 +121,4 @@ def build_fact_pack(
     forecast_end: int,
 ) -> dict:
     prompt = build_factpack_prompt(brief, evidence_pack, foundation_check, forecast_start, forecast_end)
-    return client.complete_json(FACTPACK_SYSTEM, prompt, temperature=0.2, max_tokens=5000)
+    return client.complete_json(FACTPACK_SYSTEM, prompt, max_tokens=8000)

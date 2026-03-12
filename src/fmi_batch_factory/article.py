@@ -4,8 +4,6 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from .deepseek_client import DeepSeekClient
-from .kimi_client import KimiClient
 from .openai_client import OpenAIProseClient
 from .style_guide import FULL_STYLE_BLOCK
 
@@ -463,9 +461,7 @@ def _sanitize(node: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 def build_article(
-    ds_client: DeepSeekClient,
-    kimi_client: KimiClient,
-    openai_prose_client: OpenAIProseClient,
+    prose_client: OpenAIProseClient,
     fact_pack: dict,
     evidence_pack: dict,
     forecast_start: int,
@@ -473,9 +469,12 @@ def build_article(
 ) -> dict:
     market = fact_pack.get("market_name", "Market")
 
-    prose, winning_agent = _build_prose_parallel(
-        ds_client, kimi_client, openai_prose_client, fact_pack, forecast_start, forecast_end
-    )
+    prompt = _build_prose_prompt(fact_pack, forecast_start, forecast_end)
+    try:
+        prose = prose_client.complete_json(PROSE_SYSTEM, prompt, temperature=0.4, max_tokens=7000)
+    except Exception:
+        prose = {}
+    winning_agent = "OpenAI-GPT4o"
 
     # Base required FAQs (deterministic) + AI-generated additional FAQs
     base_faqs = _det_faqs(fact_pack, forecast_end)

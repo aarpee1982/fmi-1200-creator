@@ -7,14 +7,11 @@ from pathlib import Path
 from typing import Callable
 
 from .article import build_article
-from .deepseek_client import DeepSeekClient
 from .foundation import assess_foundation
 from .factpack import build_fact_pack
-from .kimi_client import KimiClient
-from .openai_client import OpenAIWebSearchClient, OpenAIProseClient
+from .openai_client import OpenAIWebSearchClient, OpenAIReasoningClient, OpenAIProseClient
 from .renderer import render_docx
 from .utils import filename_for_market, slugify
-
 
 BATCH_SIZE     = 10
 CONCURRENCY    = 3
@@ -28,42 +25,24 @@ def _write_json(path: Path, data: object) -> None:
 
 
 def _search_queries(brief: dict) -> list[tuple[str, bool]]:
-    """
-    Returns list of (query_string, allow_company_sources) tuples.
-    We fire 5 targeted searches instead of 1 vague one.
-    allow_company_sources=True relaxes the domain filter for that query
-    so company annual reports and investor pages can pass through.
-    """
-    name = brief["market_name"]
+    name      = brief["market_name"]
     countries = ", ".join(brief.get("priority_countries", [])[:4])
     segments  = ", ".join(brief.get("benchmark_variables", [])[:3])
-
     return [
-        # 1. Market sizing — regulatory and government sources
-        (f"{name} market size value 2024 2025 industry statistics government FDA WHO", False),
-
-        # 2. Key companies — explicitly target company filings and profiles
+        (f"{name} market size value 2024 2025 industry statistics", False),
         (f"{name} leading companies manufacturers market share annual report revenue 2024 2025", True),
-
-        # 3. Country/regional data
         (f"{name} market by country {countries} growth rate statistics", False),
-
-        # 4. Regulatory and clinical drivers
         (f"{name} regulatory approval clinical guidelines treatment trends {segments}", False),
-
-        # 5. Recent developments — M&A, launches, partnerships
-        (f"{name} market news acquisitions product launches partnerships 2024 2025", True),
+        (f"{name} acquisitions product launches partnerships 2024 2025", True),
     ]
 
 
 def _multi_search(client: OpenAIWebSearchClient, brief: dict, log: Callable) -> dict:
-    """Fire multiple targeted searches and merge the evidence cards."""
-    name = brief["market_name"]
-    queries = _search_queries(brief)
+    name      = brief["market_name"]
     all_cards: list[dict] = []
-    seen_urls: set[str] = set()
+    seen_urls: set[str]   = set()
 
-    for query, allow_companies in queries:
+    for query, allow_companies in _search_queries(brief):
         try:
             log(f"[{name}] Searching: {query[:70]}...")
             result = client.search_once(query, allow_company_sources=allow_companies)
@@ -72,17 +51,12 @@ def _multi_search(client: OpenAIWebSearchClient, brief: dict, log: Callable) -> 
                 if url not in seen_urls:
                     seen_urls.add(url)
                     all_cards.append(card)
-            time.sleep(0.5)  # avoid rate limits
+            time.sleep(0.5)
         except Exception as e:
-            log(f"[{name}] Search failed for query: {e}")
-            continue
+            log(f"[{name}] Search failed: {e}")
 
-    log(f"[{name}] Total unique evidence cards: {len(all_cards)}")
-    return {
-        "evidence_cards": all_cards,
-        "raw_evidence_card_count": len(all_cards),
-        "filtered_evidence_card_count": len(all_cards),
-    }
+    log(f"[{name}] Total evidence cards: {len(all_cards)}")
+    return {"evidence_cards": all_cards}
 
 
 def _load_seen(seen_path: Path) -> set[str]:
@@ -110,9 +84,8 @@ def _process_one(
     brief: dict,
     output_dir: Path,
     search_client: OpenAIWebSearchClient,
-    ds_client: DeepSeekClient,
-    kimi_client: KimiClient,
-    openai_prose_client: OpenAIProseClient,
+    reasoning_client: OpenAIReasoningClient,
+    prose_client: OpenAIProseClient,
     log: Callable[[str], None],
 ) -> dict:
     market_name = brief.get("market_name", "Unknown")
@@ -120,25 +93,19 @@ def _process_one(
     market_dir  = output_dir / market_slug
 
     try:
-        # 5 targeted searches instead of 1
         evidence_pack = _multi_search(search_client, brief, log)
+        foundation    = assess_foundation(evidence_pack)
 
-        log(f"[{market_name}] Assessing foundation ({len(evidence_pack.get('evidence_cards', []))} cards)...")
-        foundation = assess_foundation(evidence_pack)
-
-        log(f"[{market_name}] Building fact pack (DeepSeek reasoning)...")
-        fact_pack = build_fact_pack(ds_client, brief, evidence_pack, foundation, FORECAST_START, FORECAST_END)
+        log(f"[{market_name}] Building fact pack with o3-mini reasoning...")
+        fact_pack = build_fact_pack(reasoning_client, brief, evidence_pack, foundation, FORECAST_START, FORECAST_END)
 
         if not _has_valid_numbers(fact_pack, FORECAST_END):
-            raise ValueError("Fact pack has zero or missing core numbers.")
+            raise ValueError("Fact pack missing core numbers.")
 
-        log(f"[{market_name}] Running prose agents in parallel...")
+        log(f"[{market_name}] Writing article with gpt-4o...")
         article = build_article(
-            ds_client, kimi_client, openai_prose_client,
-            fact_pack, evidence_pack, FORECAST_START, FORECAST_END,
+            prose_client, fact_pack, evidence_pack, FORECAST_START, FORECAST_END
         )
-        winning = article.get("winning_agent", "unknown")
-        log(f"[{market_name}] Best prose from: {winning}")
 
         _write_json(market_dir / "evidence_pack.json", evidence_pack)
         _write_json(market_dir / "foundation_check.json", foundation)
@@ -147,16 +114,16 @@ def _process_one(
 
         docx_path = market_dir / filename_for_market(market_name)
         render_docx(article, docx_path)
-        log(f"[{market_name}] Done. DOCX saved.")
+        log(f"[{market_name}] Done.")
 
         return {
-            "market_name":      market_name,
-            "market_slug":      market_slug,
-            "status":           "processed",
-            "winning_agent":    winning,
+            "market_name":       market_name,
+            "market_slug":       market_slug,
+            "status":            "processed",
+            "winning_agent":     "OpenAI-GPT4o",
             "foundation_status": foundation["status"],
-            "evidence_cards":   foundation["evidence_cards"],
-            "docx_path":        str(docx_path),
+            "evidence_cards":    foundation["evidence_cards"],
+            "docx_path":         str(docx_path),
         }
 
     except Exception as exc:
@@ -173,12 +140,12 @@ def run_batch(
     output_dir: Path,
     seen_path: Path,
     openai_key: str,
-    deepseek_key: str,
-    deepseek_base_url: str,
-    deepseek_model: str,
-    kimi_key: str,
-    kimi_base_url: str,
-    kimi_model: str,
+    deepseek_key: str = "",
+    deepseek_base_url: str = "",
+    deepseek_model: str = "",
+    kimi_key: str = "",
+    kimi_base_url: str = "",
+    kimi_model: str = "",
     log: Callable[[str], None] = print,
     batch_size: int = BATCH_SIZE,
     concurrency: int = CONCURRENCY,
@@ -189,22 +156,21 @@ def run_batch(
     batch      = pending[:batch_size]
 
     if not batch:
-        log("No pending briefs to process.")
+        log("No pending briefs.")
         return {"processed": 0, "failed": 0, "items": []}
 
-    log(f"Loaded {len(batch)} briefs. Running {concurrency} at a time.")
+    log(f"{len(batch)} briefs to process. Running {concurrency} at a time.")
 
-    search_client       = OpenAIWebSearchClient(api_key=openai_key)
-    ds_client           = DeepSeekClient(api_key=deepseek_key, base_url=deepseek_base_url, model=deepseek_model)
-    kimi_client         = KimiClient(api_key=kimi_key, base_url=kimi_base_url, model=kimi_model)
-    openai_prose_client = OpenAIProseClient(api_key=openai_key)
+    search_client    = OpenAIWebSearchClient(api_key=openai_key)
+    reasoning_client = OpenAIReasoningClient(api_key=openai_key)
+    prose_client     = OpenAIProseClient(api_key=openai_key)
 
     summary = {"processed": 0, "failed": 0, "items": []}
 
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures = {
             ex.submit(_process_one, brief, output_dir,
-                      search_client, ds_client, kimi_client, openai_prose_client, log): brief
+                      search_client, reasoning_client, prose_client, log): brief
             for brief in batch
         }
         for fut in as_completed(futures):
@@ -218,5 +184,5 @@ def run_batch(
 
     _write_json(output_dir / "batch_summary.json", summary)
     _save_seen(seen_path, seen)
-    log(f"Batch complete. Processed: {summary['processed']}  Failed: {summary['failed']}")
+    log(f"Done. Processed: {summary['processed']}  Failed: {summary['failed']}")
     return summary
